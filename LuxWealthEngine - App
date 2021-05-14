@@ -1,0 +1,1212 @@
+#-------------------------------------------- LUX WEALTH FORECASTING ENGINE --------------------------------------------#
+
+#----------------------- PACKAGES -----------------------#
+
+library("fBasics")
+library("Quandl")
+library("fGarch")
+library("quantmod")
+library("rugarch")
+library("timeSeries")
+library("tseries")
+library("xts")
+library("testthat")
+library("PortfolioAnalytics")
+library("PerformanceAnalytics")
+library("WeightedPortTest")
+library("dplyr")
+library("shiny")
+library("lubridate")
+library("ggplot2")
+
+library("devtools") ## Enables installation of packages from Github
+library("rsconnect")
+
+#-----------------------------------------------------------#
+
+#-----------------------------------------------------------#
+
+
+##----------------------------------------------------------
+## Gather market data and develop Capital Market Assumptions
+##----------------------------------------------------------
+
+## Gather S&P, Barclays Agg, and Cash returns data
+symbols <- c("SPY", "AGG", "SHY")
+
+prices <- NULL
+
+## The length of time for which data are available is quite different for the ETFs and BTC. Pull the data in separately to
+## longest length of each series as possible.
+
+btc.price <- getSymbols("BTC-USD", from="2016-10-1", to="2020-02-01", src = "yahoo", auto.assign = FALSE)
+
+btc.price <- Ad(btc.price)
+colnames(btc.price) <- "BTC"
+
+for (i in 1:length(symbols)){
+        symbol_price<-getSymbols(symbols[i], from="2002-07-30", to="2020-02-01", src = "yahoo", auto.assign = TRUE)
+        prices<-cbind(prices,Ad(get(symbols[i])))
+}
+
+colnames(prices) <- symbols
+prices <- na.approx(prices)
+
+returns <- na.omit(Return.calculate(prices, method = "log"))
+
+btc.return <- na.approx(Return.calculate(btc.price, method = "log"))
+
+
+## Develop Capital Market Assumptions for simulation -----------
+
+## Build Returns vector
+annual_returns <- data.frame(Return.annualized(returns))
+
+annual_BTC <- data.frame(Return.annualized(btc.return))
+
+annual_returns <- cbind(annual_returns, annual_BTC)
+
+## Build Volatility vectors
+annual_volatility <- data.frame(sd.annualized(returns))
+
+btc_volatility <- data.frame(sd.annualized(btc.return))
+
+annual_volatility <- cbind(annual_volatility, btc_volatility)
+
+## Build Correlation matrix
+annual_correlation <- data.frame(cor(returns, method = "pearson"))
+
+btc_correlation <- data.frame(cor(na.omit(cbind(returns, btc.return)), method = "pearson"))
+
+## Over the analyzable time period, BTC has had only ~2% correlation with major asset classes. This means that it's going to
+## pull through as a high diversifying asset if we include as is. In order to be more conservative and acknowledging this
+## involves quite a bit of guess work we're going to assume BTC's correlations are as follows:
+##
+## BTC-SPY = .2
+## BTC-AGG = .1
+## BTC-SHY = .1
+
+btc_correlation <- matrix(data = c(.2, .2, .1, 1), ncol = 4, nrow = 1)
+colnames(btc_correlation) <- c("SPY", "AGG", "SHY", "BTC")
+rownames(btc_correlation) <- "BTC"
+
+annual_correlation <- matrix(c(1, -.12, -.34, .20,
+                               -.12, 1, .51, .20,
+                               -.34, .51, 1, .10,
+                               .20, .10, .10, 1)
+                             , nrow = 4, ncol = 4)
+
+colnames(annual_correlation) <- c("SPY", "AGG", "SHY", "BTC")
+rownames(annual_correlation) <- c("SPY", "AGG", "SHY", "BTC")
+
+## Build Covariance matrix
+
+annual_cov <- diag(annual_volatility, ncol = 4, nrow = 4) %*% annual_correlation %*% diag(annual_volatility, ncol = 4, nrow = 4)
+
+
+
+##--------------------------------------
+## Application construction begins here
+##--------------------------------------
+
+ui <- shinyUI(navbarPage(title = "LuX Forecasting Engine |", theme = "https://bootswatch.com/3/flatly/bootstrap.min.css",
+                         
+                         
+                         tabPanel("Demographic Information",
+                                  
+                                  
+                                  ## Select ages and analysis period inputs for model.
+                                  sidebarPanel(
+                                          sliderInput(inputId = "age", 
+                                                      label = "Select Current Age",
+                                                      value = 25, min = 1, max =100),
+                                          sliderInput(inputId = "retire",
+                                                      label = "Select Desired Retirement Age",
+                                                      value = 60, min = 1, max = 100),
+                                          sliderInput(inputId = "period",
+                                                      label = "Select Age to End Analysis",
+                                                      value = 90, min = 1, max = 100),
+                                          style = "color: #000000" ## Changes the text color for sliders to black.
+                                          
+                                  ),
+                                  
+                                  
+                                  tags$style("a{color: #FFFFFF}") ## Changes the color of the tab titles text (i.e "Demographic Information") to white.
+                                  
+                         ),
+                         
+                         
+                         tabPanel("Asset Allocation",
+                                  
+                                  ## Select allocation inputs.
+                                  sidebarPanel(
+                                          sliderInput(inputId = "stock",
+                                                      label = "Select Allocation to Stock (as %)",
+                                                      value = 50, min = 0, max = 100),
+                                          sliderInput(inputId = "bonds",
+                                                      label = "Select Allocation to Bonds (as %)",
+                                                      value = 50, min = 0, max = 100),
+                                          sliderInput(inputId = "crypto",
+                                                      label = "Select Allocation to Crypto (as %)",
+                                                      value = 0, min = 0, max = 5),
+                                          sliderInput(inputId = "cash",
+                                                      label = "Select Allocation to Cash (as %)",
+                                                      value = 0, min = 0, max = 100),
+                                          sliderInput(inputId = "inflation",
+                                                      label = "Select Annual Inflation Adjustment (as %)",
+                                                      value = 2, min = 0, max = 10),
+                                          style = "color: #000000"
+                                          
+                                  )
+                                  
+                         ),
+                         
+                         
+                         tabPanel("Goals and Expenses",
+                                  
+                                  ## Select desired goals and expenses
+                                  sidebarPanel(
+                                          sliderInput(inputId = "spend",
+                                                      label = "Desired Lifestyle Spending in Retirement (in $)",
+                                                      value = 50000, min = 20000, max = 500000, step = 1000),
+                                          sliderInput(inputId = "legacy",
+                                                      label = "Legacy Wealth (optional)",
+                                                      value = 0, min = 0, max = 10000000, step = 10000),
+                                          numericInput(inputId = "inc_tax",
+                                                       label = "Input Projected Post-Retirement Income Tax Rate",
+                                                       value = .20, min = 0, max = 1),
+                                          numericInput(inputId = "cap_tax",
+                                                       label = "Input Projected Capital Gains Tax Rate",
+                                                       value = .20, min = 0, max = 1),
+                                          style = "color: #000000"
+                                          
+                                  )
+                                  
+                         ),
+                         
+                         
+                         tabPanel("Income",
+                                  
+                                  ## Input expected incomes in retirement. Namely, Social Security/pensions and rent.
+                                  sidebarPanel(
+                                          numericInput(inputId = "ss",
+                                                       label = "Input Projected Annual Social Security Benefit (in $)",
+                                                       value = 0, min = 0, max = 100000),
+                                          numericInput(inputId = "pension",
+                                                       label = "Input Projected Annual Pension Benefit (in $)",
+                                                       value = 0, min = 0, max = 250000),
+                                          numericInput(inputId = "annuity",
+                                                       label = "Input Projected Annuity Payments (in $)",
+                                                       value = 0, min = 0, max = 10000000),
+                                          numericInput(inputId = "rent",
+                                                       label = "Input Annual Rent Received (in $)",
+                                                       value = 0, min = 0, max = 100000000),
+                                          style = "color: #000000"
+                                          
+                                  )
+                                  
+                         ),
+                         
+                         
+                         tabPanel("Assets, Savings and Liabilities",
+                                  
+                                  
+                                  ## Input beginning account values and savings rates for brokerage and retirement accounts
+                                  sidebarPanel(
+                                          numericInput(inputId = "brok",
+                                                       label = "Current Value of Brokerage Accounts (in $)",
+                                                       value = 100000, min = 0, max = 100000000),
+                                          numericInput(inputId = "brok_save",
+                                                       label = "Define Annual Savings into Brokerage Accounts (in $)",
+                                                       value = 0, min = 0, max = 1000000),
+                                          numericInput(inputId = "ira",
+                                                       label = "Current Value of IRAs (in $)",
+                                                       value = 0, min = 0, max = 100000000),
+                                          numericInput(inputId = "ira_save",
+                                                       label = "Define Annual Savings into IRAs (in $)",
+                                                       value = 0, min = 0, max = 6500),
+                                          numericInput(inputId = "roth",
+                                                       label = "Current Value of Roth IRAs (in $)",
+                                                       value = 0, min =0 , max = 100000000),
+                                          numericInput(inputId = "roth_save",
+                                                       label = "Define Annual Savings in Roth IRAs (in $)",
+                                                       value = 0, min = 0, max = 6500),
+                                          numericInput(inputId = "k_plan",
+                                                       label = "Current Value of 401Ks or Employer Defined Contribution Plans (in $)",
+                                                       value = 0, min = 0, max = 100000000),
+                                          numericInput(inputId = "k_save",
+                                                       label = "Define Annual Savings into 401K/DC Plan (in $)",
+                                                       value = 0, min = 0, max = 25000),
+                                          numericInput(inputId = "bank",
+                                                       label = "Current Value of Bank Accounts (Checking/Savings)",
+                                                       value = 0, min = 0, max = 100000000),
+                                          style = "color: #000000"
+                                          
+                                  )
+                                  
+                         ),
+                         
+                         
+                         
+                         tabPanel("Results",
+                                  
+                                  tabsetPanel(
+                                          
+                                          tabPanel("Allocation",  
+                                                   ## Action button to begin the simulation
+                                                   actionButton(inputId = "simulate", label = "Simulate!"),
+                                                   
+                                                   ## Create place for pie chart to display asset allocation.
+                                                   plotOutput("pie"),
+                                                   
+                                          ),
+                                          
+                                          tabPanel("Wealth Forecast",
+                                                   
+                                                   ## Create place for Wealth Forecast graph
+                                                   plotOutput("wealth_forecast")
+                                                   
+                                          ),
+                                          
+                                          tabPanel("Goal Funding Status",
+                                                   
+                                                   ## Create place for Funding Ratio and Goal Funding graphs
+                                                   plotOutput("funding_ratio")
+                                                   
+                                          ),
+                                          
+                                          tabPanel("Active Simulations",
+                                                   
+                                                   ## Create place for Active Simulations graph
+                                                   plotOutput("active_sim")
+                                                   
+                                          ),
+                                          
+                                          tabPanel("Potential Wealth",
+                                                   
+                                                   ## Barplot to display final wealth at pre-defined quantiles
+                                                   
+                                                   plotOutput("final_wealth_barplot")
+                                                   
+                                          ),
+                                          
+                                          tabPanel("Forecast Table",
+                                                   
+                                                   ## Create data-table to display wealth quantiles
+                                                   
+                                                   DT::dataTableOutput("cf_quantiles")
+                                                   
+                                          ),
+                                          
+                                          tabPanel("Withdrawal Table",
+                                                   
+                                                   ## Create data-table to display annual withdrawal amounts.
+                                                   
+                                                   DT::dataTableOutput("withdrawal_table")
+                                                   
+                                          ),
+                                          
+                                          tabPanel("Tax Table",
+                                                   
+                                                   ## Create data-table to display annual tax incurred
+                                                   
+                                                   DT::dataTableOutput("tax_table")
+                                                   
+                                          )
+                                          
+                                          
+                                  ),
+                                  
+                                  
+                                  tags$style("a{color: #000000")
+                                  
+                         )
+                         
+) ## Close navbarPanel
+
+) ## Close Shiny UI
+
+
+
+server <- function(input, output, session){
+        
+        ## Display pie chart showing asset allocation
+        output$pie <- renderPlot({
+                
+                ## As a general note, most of the info used to build these plots was gleaned from various internet
+                ## resources. So if they are difficult to decode, that's b/c to a degree they are piecemeal.
+                
+                stock <- input$stock/100
+                bonds <- input$bonds/100
+                crypto <- input$crypto/100
+                cash <- input$cash/100
+                
+                data <- data.frame(
+                        
+                        Assets = c("Stock", "Bonds", "Crypto", "Cash"),
+                        value = c(stock, bonds, crypto, cash),
+                        position = c(stock/2, stock + cash + crypto + bonds/2 ,
+                                     stock + crypto/2, stock + crypto+ cash/2), ## Weird formula for calculating position on pie chart
+                        labels = c(paste0(stock*100,"%"), paste0(bonds*100,"%"), 
+                                   paste0(crypto*100,"%"), paste0(cash*100,"%"))
+                )
+                
+                ggplot(data, aes(x="", y = value, fill = Assets)) + 
+                        geom_bar(stat = "identity", width = 1) +
+                        geom_text(aes(y = position ,label = labels), position = position_dodge(width = .1), size = 7) +
+                        coord_polar("y", start = 0) + 
+                        ggtitle("Asset Allocation") +
+                        theme(plot.title = element_text(size = 20, hjust = .5),
+                              axis.title.x = element_blank(),
+                              axis.text.x = element_blank(),
+                              axis.ticks.x = element_blank(),
+                              panel.grid.major = element_blank(),
+                              panel.grid.minor = element_blank(),
+                              axis.title.y = element_blank(),
+                              axis.text.y = element_blank(),
+                              legend.text = element_text(size = 16),
+                              legend.title = element_text(size = 20)
+                        )
+                
+        })
+        
+        
+        
+        ## Create simulation for wealth forecast.
+        get_cf_summary <- eventReactive(input$simulate, {
+                
+                
+                ##-------------------------------
+                ## Inputs
+                ##-------------------------------
+                
+                ## Age inputs (in Years)
+                age <- input$age
+                retire <- input$retire
+                period <- input$period
+                
+                pretire <- retire-age ##"Pre-retire": number of years pre-retirement
+                
+                ## If someone is already in retirement, then pretire will be negative which will mess up the app. If negative,
+                ## set pretire to '0' such that we implicitly only simulate post-retirement years.
+                
+                if(pretire <= 0 ){
+                        
+                        pretire <- 0
+                }
+                
+                ##"Post-retire": number years spent in retirement. If modeled "pre-retirement" then postire is number of years anticipated to
+                ## spend in retirement. If modeled during or at retirement then postire is number of years left in retirement. Use 'max' to
+                ## which to use.
+                
+                postire <- period - max(retire, age)
+                
+                ## Allocation inputs. Divide by 100 for use in calculations.
+                
+                stock <- input$stock/100
+                bonds <- input$bonds/100
+                crypto <- input$crypto/100
+                cash <- input$cash/100
+                inflation <- input$inflation/100
+                
+                ## Goals and Expenses
+                spend <- input$spend
+                legacy <- input$legacy
+                
+                ## Incomes
+                ss <- input$ss
+                pension <- input$pension
+                annuity <-input$annuity
+                rent <- input$rent
+                
+                ## Assets
+                brok <- input$brok
+                ira <- input$ira
+                roth <- input$roth
+                k_plan <- input$k_plan
+                bank <- input$bank
+                
+                ## Savings inputs
+                brok_save <- input$brok_save
+                ira_save <- input$ira_save
+                roth_save <- input$roth_save
+                k_save <- input$k_save
+                
+                ## Tax Rates
+                income_tax <- input$inc_tax
+                capital_tax <- input$cap_tax
+                port_turnover <- .20
+                
+                
+                ##-------------------------------
+                
+                ##------------------------ Define additional simulation parameters ------------------------##
+                
+                ## Determine expected return and volatility for user defined portfolio.
+                
+                allocate <- matrix(data= c(stock, bonds, cash, crypto), nrow = 1, ncol = 4)
+                colnames(allocate) <- c("stock", "bonds", "cash", "crypto")
+                
+                port_return <- allocate %*% t(as.matrix(annual_returns))
+                port_vol <- sqrt((allocate) %*% as.matrix(annual_cov) %*% t(allocate))
+                
+                
+                ## Number of...
+                n.pretire <- pretire ## pre-retirement years to simulate
+                n.postire <- postire ## post-retirement years to simulate
+                n.obs <- n.pretire + n.postire
+                
+                
+                ##----------------------------------------
+                ## Create Time Index
+                ##----------------------------------------
+                
+                start.date <- year(Sys.Date())
+                
+                end.date <- start.date + (period - age - 1) ## Should i use n.obs instead?
+                
+                dates <- seq(from = as.Date(as.character(start.date), format = "%Y"), 
+                             to = as.Date(as.character(end.date), format = "%Y"), by = "years") ##Create dates sequence
+                
+                
+                ##----------------------------------------
+                ## Define vectors for savings and spending
+                ##----------------------------------------
+                
+                
+                ## Inflation adjustments. Adjustments are made each year.
+                yearly.inflation <- matrix(data = (1+inflation)^seq(from = 1, to = n.obs, by = 1), ncol = 1)
+                
+                ## Vectors of savings rates. All taxable savings are adjusted for annual inflation
+                yearly.brok <- rbind(matrix(brok_save, nrow = n.pretire, ncol = 1), matrix(0, nrow = n.postire, ncol = 1))
+                yearly.brok <- yearly.brok*yearly.inflation
+                
+                yearly.ira <- rbind(matrix(ira_save, nrow = n.pretire, ncol = 1), matrix(0, nrow = n.postire, ncol = 1))
+                
+                yearly.roth <- rbind(matrix(roth_save, nrow = n.pretire, ncol = 1), matrix(0, nrow = n.postire, ncol = 1))
+                
+                yearly.k <- rbind(matrix(k_save, nrow = n.pretire, ncol = 1), matrix(0, nrow = n.postire, ncol = 1))
+                
+                
+                ## Vector of yearly spending adjusted for inflation.
+                
+                yearly.spend <- rbind(matrix(0, nrow = n.pretire, ncol = 1), matrix(spend, nrow = n.postire, ncol = 1))
+                
+                yearly.spend <- yearly.spend*yearly.inflation
+                
+                
+                ## Vector of monthly incomes. Social Security and rental income are adjusted for inflation.
+                yearly.ss <- rbind(matrix(data = 0, nrow = n.pretire, ncol = 1), matrix(ss, nrow = n.postire, ncol = 1)) ## Vector of annual Social Security income
+                yearly.ss <- yearly.ss*yearly.inflation
+                
+                yearly.pen <- rbind(matrix(data = 0, nrow = n.pretire, ncol = 1), matrix(pension, nrow = n.postire, ncol = 1)) ## Vector of annual pension income
+                
+                yearly.ann <- rbind(matrix(data = 0, nrow = n.pretire, ncol = 1), matrix(annuity, nrow = n.postire, ncol = 1)) ## Vector of annual annuity income
+                
+                yearly.rent <- rbind(matrix(data = 0, nrow = n.pretire, ncol = 1), matrix(rent, nrow = n.postire, ncol = 1))
+                yearly.rent <- yearly.rent*yearly.inflation
+                
+                
+                ##----------------------------------- Simulation -----------------------------------##
+                
+                ## Initialize matrices that will hold data
+                ## 1) cf_summary: Matrix to store each k-th projection within j-th simulation. Reset after each j-th simulation. There are 'j' total cf_summary's
+                ## 2) withdrawal_summary: Matrix to store the withdrawals that will need to be taken from the portfolio for each k-th projection within j-th simulation.
+                ## 3) tax_summary: Matrix to store taxes incurred during each k-th projection within j-th simulation.
+                ## 4) wealth_dist: Vector to store the mean of the end wealth in each j-th cf_summary. There will be 'j' means computed.
+                ## 5) median_dist: Vector to store the median of the end wealth in each j-th cf_summary. There will be 'j' medians computed.
+                ## 6) cf_big: All of the cf_summary's smashing together. This matrix contains results from all projections. The entire simulation returns this as the result.
+                ## 7) withdrawal_big: All of the withdrawal_summary's smashed together. This matrix contains results from all projections. The entire simulation returns this as the result.
+                
+                
+                cf_summary <- NULL
+                withdrawal_summary <- NULL
+                tax_summary <- NULL
+                wealth_dist <- NULL
+                median_dist <- NULL
+                cf_big <- NULL
+                tax_big <- NULL
+                withdrawal_big <- NULL
+                
+                k <- 1
+                j <- 1
+                
+                ## Initialize 3-D array of returns. Array dims are n.obs x 1000 x 100 (i.e. rows x cols x depth)(i.e. i x k x j)
+                return_1 <- array(data = NA, c(n.obs,1000,100))
+                return_1[] <- rnorm(n.obs*1000*100, mean = port_return, port_vol)
+                
+                withProgress(message = "Building Model", {
+                        
+                        while( j <= 100){
+                                
+                                cf_summary <- NULL
+                                
+                                withdrawal_summary <- NULL
+                                
+                                tax_summary <- NULL
+                                
+                                k <- 1
+                                
+                                
+                                while(k <= ncol(return_1)){
+                                        
+                                        return_2 <- as.matrix(return_1[,k,j])
+                                        
+                                        ## Initialize start values and end vectors. Simulation begins with starting values of accounts. Results each period
+                                        ## are calculated and flow through to the end vector.
+                                        retirement_start <- ira+roth+k_plan
+                                        
+                                        taxable_start <- brok+bank
+                                        
+                                        withdrawal_amt <- matrix(data = 0, nrow = n.obs, ncol = 1)
+                                        
+                                        taxes <- matrix(data = NA, nrow = n.obs, ncol = 1)
+                                        
+                                        retirement_end <- matrix(data = NA, nrow = n.obs, ncol = 1)
+                                        
+                                        taxable_end <- matrix(data = NA, nrow = n.obs, ncol = 1)
+                                        
+                                        ## Used for tax calculations. This marker will be used to indicate if a withdrawal was taken from retirement accounts.
+                                        retirement_withdrawal_marker <- 0
+                                        
+                                        
+                                        for(i in 1:n.obs){
+                                                
+                                                ## Step 1) Determine if iteration 'i' is pre- or post- retirement.
+                                                if(i <= n.pretire){
+                                                        
+                                                        ## Step 2) If this is not the first period, "starting" taxable and retirement values equals the
+                                                        ## ending values from the previous iteration, savings are added, withdrawal_amt[i] = taxes incurred during
+                                                        ## the previous year are subtracted from taxable assets and return is applied.
+                                                        
+                                                        if(i != 1){
+                                                                
+                                                                taxable_end[i] <- (taxable_end[i-1] + yearly.brok[i] - withdrawal_amt[i])*(1+return_2[i])
+                                                                
+                                                                retirement_end[i] <- (retirement_end[i-1] + yearly.ira[i] + yearly.k[i] + yearly.roth[i])*(1+return_2[i])
+                                                                
+                                                                ## If this is the first period, "starting" taxable and retirement values equals the beginning 
+                                                                ## balances calculated earlier.
+                                                        } else {
+                                                                
+                                                                taxable_end[i] <- (taxable_start + yearly.brok[i])*(1+return_2[i])
+                                                                
+                                                                retirement_end[i] <- (retirement_start + yearly.ira[i] + yearly.k[i] + yearly.roth[i])*(1+return_2[i])
+                                                                
+                                                        }
+                                                        
+                                                        ## Step 3) Calculate taxes. Taxes in the pre-retirement period are calculated as:
+                                                        ## (portfolio turnover) x (value of brokerage accounts) x (long-term capital gains)
+                                                        ## Taxes are calculated for the i-th period and paid in the i+1 period. In pre-retirement,
+                                                        ## the only withdrawals taken will be for taxes made on portfolio gains so taxes[i] contains
+                                                        ## the taxes incurred in the i-th period and this feeds into them being paid in withdrawals[i+1].
+                                                        
+                                                        if(i != 1){
+                                                                
+                                                                if((taxable_end[i] - taxable_end[i-1]) >= 0){
+                                                                        
+                                                                        taxes[i] <- port_turnover*(taxable_end[i] - taxable_end[i-1])*capital_tax
+                                                                        
+                                                                } else {
+                                                                        
+                                                                        taxes[i] <- 0
+                                                                }
+                                                                
+                                                        } else {
+                                                                
+                                                                if((taxable_end[i] - taxable_start) >= 0){
+                                                                        
+                                                                        taxes[i] <- port_turnover*(taxable_end[i] - taxable_start)*capital_tax
+                                                                        
+                                                                } else {
+                                                                        
+                                                                        taxes[i] <- 0
+                                                                }
+                                                                
+                                                        }
+                                                        
+                                                        withdrawal_amt[i+1] <- taxes[i]
+                                                        
+                                                        ## The "else" statement that follows applies if we are in retirement.
+                                                } else {
+                                                        
+                                                        ## Step 4) If iteration 'i' is post-retirement, determine withdrawal amount as the difference between
+                                                        ## the yearly spending target minus all income sources (SS, rent, etc.) plus the taxes that need to be paid
+                                                        ## from the previous period.
+                                                        
+                                                        withdrawal_amt[i] <- yearly.spend[i, ] - yearly.ss[i] - yearly.pen[i] - yearly.ann[i] - yearly.rent[i] + taxes[i-1]
+                                                        
+                                                        
+                                                        ## Step 5) Determine where the withdrawal will be taken from. Taxable accounts are withdrawn from first.
+                                                        ## Once taxable assets are exhausted, then withdrawals are taken from retirement.
+                                                        
+                                                        if(i == 1){
+                                                                
+                                                                if(taxable_start > 0){
+                                                                        
+                                                                        taxable_end[i] <- taxable_start - withdrawal_amt[i]
+                                                                        
+                                                                        retirement_end[i] <- retirement_start
+                                                                        
+                                                                } else {
+                                                                        
+                                                                        taxable_end[i] <- taxable_start
+                                                                        
+                                                                        retirement_end[i] <- retirement_start - withdrawal_amt[i]
+                                                                }
+                                                                
+                                                                
+                                                        } else {
+                                                                
+                                                                if(taxable_end[i-1] > 0){
+                                                                        
+                                                                        taxable_end[i] <- taxable_end[i-1] - withdrawal_amt[i]
+                                                                        
+                                                                        retirement_end[i] <- retirement_end[i-1]
+                                                                        
+                                                                } else {
+                                                                        
+                                                                        retirement_withdrawal_marker <- 1
+                                                                        
+                                                                        taxable_end[i] <- taxable_end[i-1]
+                                                                        
+                                                                        retirement_end[i] <- retirement_end[i-1] - withdrawal_amt[i]
+                                                                        
+                                                                }
+                                                        }
+                                                        
+                                                        
+                                                        ## Step 6) Determine if values of taxable/retirement accounts are positive, if so, then apply the
+                                                        ## return for that period. If negative, then return is not applied because that doesn't make any sense.
+                                                        if(taxable_end[i] > 0){
+                                                                
+                                                                taxable_end[i] <- taxable_end[i]*(1+return_2[i])
+                                                                
+                                                        }
+                                                        
+                                                        if(retirement_end[i] > 0){
+                                                                
+                                                                retirement_end[i] <- retirement_end[i]*(1+return_2[i])
+                                                        }
+                                                        
+                                                        
+                                                        ## Step 7) Calculate the taxes incurred in period i which will be paid in the next period.
+                                                        
+                                                        ## A) Calculate taxes from income sources and retirement account withdrawals
+                                                        income_taxes <- (yearly.ss[i] + yearly.pen[i] + yearly.ann[i] + yearly.rent[i])*income_tax
+                                                        
+                                                        if(retirement_withdrawal_marker == 1){
+                                                                
+                                                                income_taxes <- income_taxes + income_tax*withdrawal_amt[i]
+                                                                
+                                                        }
+                                                        
+                                                        ## B) Calculate taxes from portfolio turnover (i.e. capital gains)
+                                                        
+                                                        if(i != 1){
+                                                                
+                                                                if((taxable_end[i] - taxable_end[i-1] + withdrawal_amt[i]) >= 0){
+                                                                        
+                                                                        gains <- port_turnover*(taxable_end[i] - taxable_end[i-1] + withdrawal_amt[i])*capital_tax
+                                                                        
+                                                                } else {
+                                                                        
+                                                                        gains <- 0
+                                                                }
+                                                                
+                                                        } else {
+                                                                
+                                                                if((taxable_end[i] - taxable_start+ withdrawal_amt[i]) >= 0){
+                                                                        
+                                                                        gains <- port_turnover*(taxable_end[i] - taxable_start + withdrawal_amt[i])*capital_tax
+                                                                        
+                                                                } else {
+                                                                        
+                                                                        gains <- 0
+                                                                }
+                                                                
+                                                        }
+                                                        
+                                                        ## C) Total Taxes = Income Taxes + Capital Gains Taxes
+                                                        
+                                                        taxes[i] <- income_taxes + gains
+                                                        
+                                                        
+                                                }
+                                                
+                                                ## Step 8) Add taxable and retirement vectors together to get ending wealth for each period.
+                                                cf_1 <- taxable_end + retirement_end
+                                                
+                                        }
+                                        
+                                        
+                                        ## Step 9) Build cash flow summary for 'k' simulation. Each k-th summary has 'i' columns.
+                                        cf_summary <- cbind(cf_summary, cf_1)
+                                        
+                                        tax_summary <- cbind(tax_summary, taxes)
+                                        
+                                        withdrawal_summary <- cbind(withdrawal_summary, withdrawal_amt)
+                                        
+                                        k <- k + 1
+                                        
+                                        
+                                }
+                                ## Step 10) Calculate wealth_dist and median_dist. Build cf_big by smashing all 'j' cf_summary's together.
+                                wealth_dist <- rbind(wealth_dist, mean(cf_summary[nrow(cf_summary),]))
+                                median_dist <- rbind(median_dist, median(cf_summary[nrow(cf_summary),]))
+                                
+                                cf_big <- cbind(cf_big, cf_summary)
+                                
+                                tax_big <- cbind(tax_big, tax_summary)
+                                
+                                withdrawal_big <- cbind(withdrawal_big, withdrawal_summary)
+                                
+                                j <- j+1
+                                
+                                
+                                incProgress(amount = 1/100)
+                                
+                        }
+                        
+                        cf_big <- as.xts(cf_big, order.by = dates)
+                        
+                        tax_big <- as.xts(tax_big, order.by = dates)
+                        
+                        withdrawal_big <- as.xts(withdrawal_big, order.by = dates)
+                        
+                        summaries <- list("cf_big" = cf_big, "tax_big" = tax_big, "withdrawal_big" = withdrawal_big)
+                        
+                        return(summaries)
+                        
+                })
+                
+        })
+        
+        ##---------------------------------------
+        ## Plot Wealth paths
+        ##---------------------------------------      
+        
+        output$wealth_forecast <- renderPlot({
+                
+                ##-------------------------------
+                ## Create time index for plot
+                ##-------------------------------
+                
+                age <- input$age
+                period <- input$period
+                
+                start.date <- year(Sys.Date())
+                
+                end.date <- start.date + (period - age -1)
+                
+                dates <- seq(from = as.Date(as.character(start.date), format = "%Y"), 
+                             to = as.Date(as.character(end.date), format = "%Y"), by = "years") ##Create dates sequence
+                
+                ##-------------------------------
+                
+                summaries <- get_cf_summary()
+                
+                cf_quantiles <- t(apply(X = summaries$cf_big, 
+                                        MARGIN = 1, 
+                                        function(x) quantile(x, c(.05,.1,.15,.2,.25,.3,.35,.4,.45,.5,.55,.60,.65,.70,.75,.80,.85,.90,.95))))
+                
+                values <- data.frame(coredata(cf_quantiles[ , 4]))
+                colnames(values) <- "80% Quantile"
+                
+                values_1 <- data.frame(coredata(cf_quantiles[ , 10]))
+                colnames(values_1) <- "50% Quantile"
+                
+                values_2 <- data.frame(coredata(cf_quantiles[ , 14]))
+                colnames(values_2) <- "30% Quantile"
+                
+                values[ values <= 0 ] <- 0
+                values_1[ values_1 <= 0 ] <- 0 ## If wealth goes negative, set to zero
+                values_2[ values_2 <= 0 ] <- 0
+                
+                test <- NULL
+                
+                for(i in 1:nrow(values)){
+                        
+                        temp <- rbind(values_2[i,]- values_1[i,], values_1[i,] - values[i,], values[i,])
+                        
+                        test <- rbind(test, temp)
+                        
+                }
+                
+                dates_test <- data.frame(
+                        
+                        Time = rep(dates, each= 3),
+                        Percentile = rep(c('30%','50%','80%'), nrow(cf_quantiles)),
+                        Value = test/1000000
+                        
+                )
+                
+                ggplot(data = dates_test, aes(x = Time, y = Value)) +
+                        geom_area(aes(fill = Percentile)) +
+                        ggtitle("Potential Wealth Paths") +
+                        theme(axis.text.x=element_text(angle=60, hjust=1)) +
+                        scale_x_date(date_breaks = "5 year", date_labels = "%Y") +
+                        annotate("text", 
+                                 x = last(dates), 
+                                 y = dates_test[nrow(dates_test), 3], 
+                                 label = paste0("$", format(round((dates_test[nrow(dates_test), 3]*1000000), digits = 0), big.mark = ",")),
+                                 hjust = 1) +
+                        annotate("text", 
+                                 x = last(dates), 
+                                 y = (dates_test[nrow(dates_test), 3] + dates_test[(nrow(dates_test)-1), 3]), 
+                                 label = paste0("$", format(round(((dates_test[nrow(dates_test), 3] + dates_test[(nrow(dates_test)-1), 3])*1000000), digits = 0), big.mark = ",")),
+                                 hjust = 1) +
+                        annotate("text", 
+                                 x = last(dates), 
+                                 y = (dates_test[nrow(dates_test), 3] + dates_test[(nrow(dates_test)-1), 3] + dates_test[(nrow(dates_test)-2), 3]), 
+                                 label = paste0("$", format(round(((dates_test[nrow(dates_test), 3] + dates_test[(nrow(dates_test)-1), 3] + dates_test[(nrow(dates_test)-2), 3])*1000000), digits = 0), big.mark = ",")),
+                                 hjust = 1)
+                
+                
+        })
+        
+        
+        ##---------------------------------------
+        ## Plot Percentage of Active Simulations
+        ##--------------------------------------- 
+        
+        output$active_sim <- renderPlot({
+                
+                ##-------------------------------
+                ## Create time index for plot
+                ##-------------------------------
+                
+                age <- input$age
+                period <- input$period
+                
+                start.date <- year(Sys.Date())
+                
+                end.date <- start.date + (period - age -1)
+                
+                dates <- seq(from = as.Date(as.character(start.date), format = "%Y"), 
+                             to = as.Date(as.character(end.date), format = "%Y"), by = "years") ##Create dates sequence
+                
+                ##-------------------------------
+                
+                summaries <- get_cf_summary()
+                
+                cf_summary <- summaries$cf_big
+                
+                ## Once account balances turn negative, run out of money. End that simulation by setting negative values to NA.
+                
+                cf_summary[ cf_summary <= 0 ] <- NA
+                
+                
+                active_sim <- (1- rowSums(is.na(cf_summary))/ncol(cf_summary))*100 ## Multiplying by 100 converts proportion to percentage.
+                
+                active_sim <- xts(active_sim, order.by = dates)
+                
+                plot(active_sim, xlab = "Year", 
+                     ylab = "Percentage(%) of Active Simulations", ylim = c(-10,120), 
+                     main = "Percentage (%) of Active Simulations by Year") 
+                
+                
+                
+        })
+        
+        
+        ##------------------------------------
+        ## Plot Funding Ratio
+        ##------------------------------------
+        
+        output$funding_ratio<- renderPlot({
+                
+                ## Age inputs (in Years)
+                age <- input$age
+                retire <- input$retire
+                period <- input$period
+                
+                pretire <- retire-age ##"Pre-retire": number of years pre-retirement
+                
+                ## If someone is already in retirement, then pretire will be negative which will mess up the app. If negative,
+                ## set pretire to '0' such that we implicitly only simulate post-retirement years.
+                
+                if(pretire <= 0 ){
+                        
+                        pretire <- 0
+                }
+                
+                ##"Post-retire": number years spent in retirement. If modeled "pre-retirement" then postire is number of years anticipated to
+                ## spend in retirement. If modeled during or at retirement then postire is number of years left in retirement. Use 'max' to
+                ## which to use.
+                
+                postire <- period - max(retire, age)
+                
+                ## Number of...
+                n.pretire <- pretire ## pre-retirement years to simulate
+                n.postire <- postire ## post-retirement years to simulate
+                n.obs <- n.pretire + n.postire
+                
+                # Inflation
+                inflation <- input$inflation
+                
+                ##---------------------------------
+                ## Construct Discount Rate
+                ##---------------------------------
+                
+                stock <- input$stock/100
+                bonds <- input$bonds/100
+                crypto <- input$crypto/100
+                cash <- input$cash/100
+                inflation <- input$inflation/100
+                
+                allocate <- matrix(data= c(stock, bonds, cash, crypto), nrow = 1, ncol = 4)
+                colnames(allocate) <- c("stock", "bonds", "cash", "crypto")
+                
+                port_return <- allocate %*% t(as.matrix(annual_returns))
+                port_vol <- sqrt((allocate) %*% as.matrix(annual_cov) %*% t(allocate))
+                
+                ## Calculate Discount Rate
+                discount <- (port_return) - 1.96*(port_vol/sqrt(n.obs)) - crypto*.5
+                discount.rate <- matrix((1+discount)^seq(from = 1, to = n.obs, by = 1), ncol = 1)
+                
+                ##--------------------------------------------------
+                ## Reconstruct spending, income and savings vectors.
+                ##--------------------------------------------------
+                
+                ## Goals and Expenses
+                spend <- input$spend
+                legacy <- input$legacy
+                
+                ## Incomes
+                ss <- input$ss
+                pension <- input$pension
+                annuity <-input$annuity
+                rent <- input$rent
+                
+                ## Assets
+                brok <- input$brok
+                ira <- input$ira
+                roth <- input$roth
+                k_plan <- input$k_plan
+                bank <- input$bank
+                
+                ## Savings inputs
+                brok_save <- input$brok_save
+                ira_save <- input$ira_save
+                roth_save <- input$roth_save
+                k_save <- input$k_save
+                
+                ## Inflation adjustments. Adjustments are made each year.
+                yearly.inflation <- matrix(data = (1+inflation)^seq(from = 1, to = n.obs, by = 1), ncol = 1)
+                
+                ## Vectors of savings rates. Brokerage savings rate is adjusted for annual inflation
+                yearly.brok <- rbind(matrix(brok_save, nrow = n.pretire, ncol = 1), matrix(0, nrow = n.postire, ncol = 1))
+                yearly.brok <- yearly.brok*yearly.inflation
+                
+                yearly.ira <- rbind(matrix(ira_save, nrow = n.pretire, ncol = 1), matrix(0, nrow = n.postire, ncol = 1))
+                
+                yearly.roth <- rbind(matrix(roth_save, nrow = n.pretire, ncol = 1), matrix(0, nrow = n.postire, ncol = 1))
+                
+                yearly.k <- rbind(matrix(k_save, nrow = n.pretire, ncol = 1), matrix(0, nrow = n.postire, ncol = 1))
+                
+                
+                ## Vector of yearly spending adjusted for inflation.
+                yearly.spend <- rbind(matrix(0, nrow = n.pretire, ncol = 1), matrix(spend, nrow = n.postire, ncol = 1))
+                yearly.spend <- yearly.spend*yearly.inflation
+                
+                
+                ## Vector of monthly incomes. Social Security and rental income are adjusted for inflation.
+                yearly.ss <- rbind(matrix(data = 0, nrow = n.pretire, ncol = 1), matrix(ss, nrow = n.postire, ncol = 1)) ## Vector of annual Social Security income
+                yearly.ss <- yearly.ss*yearly.inflation
+                
+                yearly.pen <- rbind(matrix(data = 0, nrow = n.pretire, ncol = 1), matrix(pension, nrow = n.postire, ncol = 1)) ## Vector of annual pension income
+                
+                yearly.ann <- rbind(matrix(data = 0, nrow = n.pretire, ncol = 1), matrix(annuity, nrow = n.postire, ncol = 1)) ## Vector of annual annuity income
+                
+                yearly.rent <- rbind(matrix(data = 0, nrow = n.pretire, ncol = 1), matrix(rent, nrow = n.postire, ncol = 1))
+                yearly.rent <- yearly.rent*yearly.inflation
+                
+                ##--------------------------------------------------------
+                
+                ##--------------------------------------------
+                ## Get Taxes at Median.
+                ##--------------------------------------------
+                ## Taxes are not fixed like lifestyle spending so we need to come up with an estimate to use and add
+                ## it to the funding goals.
+                
+                summaries <- get_cf_summary()
+                
+                tax_big <- summaries$tax_big
+                
+                tax <- apply(X = tax_big,
+                             MARGIN = 1,
+                             function(x) quantile(x, .5))
+                
+                
+                ##---------------------------------------------
+                ## Present Value and Funding Ratio Calculations
+                ##---------------------------------------------
+                
+                ## Present value calculations
+                dis.spend <- yearly.spend/discount.rate
+                dis.tax <- tax/discount.rate
+                dis.income <- (yearly.ss + yearly.pen + yearly.ann + yearly.rent)/yearly.inflation
+                dis.savings <- (yearly.brok + yearly.ira + yearly.k + yearly.roth)/yearly.inflation
+                
+                ## Divide PV's by 1MM for easier display
+                pv.spend <- sum(dis.spend)/1000000
+                pv.tax <- sum(dis.tax)/1000000
+                pv.income <- sum(dis.income)/1000000
+                pv.savings <- sum(dis.savings)/1000000
+                pv.assets <- (pv.income + pv.savings) + (brok + ira + roth + k_plan)/1000000
+                pv.expenses <- pv.spend + pv.tax
+                
+                ## Funding Ratio
+                funding.ratio <- round(pv.assets/pv.expenses, digits = 2)*100
+                funding.ratio
+                
+                
+                ##------------------------------------
+                ## Funding Ratio Bar Plot
+                ##------------------------------------
+                
+                df <- data.frame(Category = c("Assets", "Expenses"), Amount = c(pv.assets, pv.expenses))
+                
+                ggplot(data = df, aes(x = Category, y = Amount, fill = Category)) +
+                        geom_bar(stat = "identity", show.legend = FALSE) +
+                        ggtitle("Goal Funding Status") +
+                        theme_minimal() + 
+                        theme(plot.title=element_text(size = 15, hjust = 0.5, margin =  margin(0,0,20,0), face = 'bold'),
+                              axis.text=element_text(size=12),
+                              axis.title=element_text(size=12)) + 
+                        labs(x= NULL, y = "Amount (in Millions of $)") +
+                        annotate(geom = "text", x = "Assets", y = pv.assets, label = paste0("Funding Ratio: ", funding.ratio,"%"),
+                                 size  = 5, fontface = 'bold', vjust = 5) + 
+                        annotate(geom = "text", x = "Assets", y = 0, 
+                                 label = paste0("$", format(round(pv.assets*1000000, digits = 0), big.mark = ",")), size = 5, vjust = -1) +
+                        annotate(geom = "text", x = "Expenses", y = 0,
+                                 label = paste0("$", format(round(pv.expenses*1000000, digits = 0), big.mark = ",")), size = 5, vjust = -1)
+                
+                
+        })
+        
+        
+        ##-----------------------------------------------
+        ## Table of wealth quantiles for each period
+        ##-----------------------------------------------
+        
+        output$cf_quantiles <- DT::renderDataTable({
+                
+                summaries <- get_cf_summary()
+                
+                cf_summary <- summaries$cf_big
+                
+                ## Calculate quantiles for each period of all simulations run
+                
+                cf_quantiles <- t(apply(X = cf_summary, 
+                                        MARGIN = 1, 
+                                        function(x) quantile(x, c(.05,.1,.15,.2,.25,.3,.35,.4,.45,.5,.55,.60,.65,.70,.75,.80,.85,.90,.95))))
+                
+                cf_quantiles <- round(cf_quantiles, digits = 0)
+                
+                colnames(cf_quantiles) <- c("95%", "90%", "85%", "80%", "75%", "70%", "65%", "60%", "55%", "50%",
+                                            "45%", "40%", "35%", "30%", "25%", "20%", "15%", "10%", "5%")
+                
+                cf_quantiles
+                
+        })
+        
+        
+        ##------------------------------------
+        ## Barplot of final wealth.
+        ##------------------------------------
+        
+        output$final_wealth_barplot <- renderPlot({
+                
+                summaries <- get_cf_summary()
+                
+                cf_summary <- summaries$cf_big
+                
+                ## Select quantiles at 30%, 50%, and 80%
+                
+                cf_quantiles <- t(apply(X = cf_summary, 
+                                        MARGIN = 1, 
+                                        function(x) quantile(x, c(.05,.1,.15,.2,.25,.3,.35,.4,.45,.5,.55,.60,.65,.70,.75,.80,.85,.90,.95))))
+                
+                colnames(cf_quantiles) <- c("95%", "90%", "85%", "80%", "75%", "70%", "65%", "60%", "55%", "50%",
+                                            "45%", "40%", "35%", "30%", "25%", "20%", "15%", "10%", "5%")
+                
+                values <- round(cf_quantiles[nrow(cf_quantiles), c(4, 10, 14)], 0)
+                
+                values <- data.frame(Quantile = c("80%", "50%", "30%"), Wealth = as.numeric(values))
+                
+                ggplot(data = values, aes(x = Quantile, y = Wealth, fill = Quantile)) +
+                        geom_bar(stat = "identity") +
+                        ggtitle("Final Wealth by Quantile (in $)") +
+                        theme_minimal() + 
+                        theme(plot.title=element_text(size = 14, hjust = 0.5, margin =  margin(0,0,20,0)),
+                              axis.text=element_text(size=12),
+                              axis.title=element_text(size=12)) + 
+                        labs(x = "Quantile", y = "Final Wealth (in Millions of $)") +
+                        annotate(geom = "text", x = "30%", y = 0,
+                                 label = paste0("$", format(round(values$Wealth[3], digits = 0), big.mark = ",")), size = 5, vjust = -1) +
+                        annotate(geom = "text", x = "50%", y = 0,
+                                 label = paste0("$", format(round(values$Wealth[2], digits = 0), big.mark = ",")), size = 5, vjust = -1) +
+                        annotate(geom = "text", x = "80%", y = 0,
+                                 label = paste0("$", format(round(values$Wealth[1], digits = 0), big.mark = ",")), size = 5, vjust = -1)
+                
+        })
+        
+        
+        ##------------------------------------
+        ## Table of Withdrawal Amounts
+        ##------------------------------------
+        
+        output$withdrawal_table <- DT::renderDataTable({
+                
+                summaries <- get_cf_summary()
+                
+                withdrawal_big <- summaries$withdrawal_big
+                
+                ## Calculate quantiles for each period of all simulations run
+                
+                withdrawal_table <- t(apply(X = withdrawal_big, 
+                                            MARGIN = 1, 
+                                            function(x) quantile(x, c(.05,.1,.15,.2,.25,.3,.35,.4,.45,.5,.55,.60,.65,.70,.75,.80,.85,.90,.95))))
+                
+                withdrawal_table <- round(withdrawal_table, digits = 0)
+                
+                colnames(withdrawal_table) <- c("95%", "90%", "85%", "80%", "75%", "70%", "65%", "60%", "55%", "50%",
+                                                "45%", "40%", "35%", "30%", "25%", "20%", "15%", "10%", "5%")
+                
+                withdrawal_table
+                
+        })
+        
+        
+        ##------------------------------------
+        ## Table of Taxes Paid
+        ##------------------------------------
+        
+        output$tax_table <- DT::renderDataTable({
+                
+                summaries <- get_cf_summary()
+                
+                tax_big <- summaries$tax_big
+                
+                ## Calculate quantiles for each period of all simulations run
+                
+                tax_table <- t(apply(X = tax_big, 
+                                     MARGIN = 1, 
+                                     function(x) quantile(x, c(.05,.1,.15,.2,.25,.3,.35,.4,.45,.5,.55,.60,.65,.70,.75,.80,.85,.90,.95))))
+                
+                tax_table <- round(tax_table, digits = 0)
+                
+                colnames(tax_table) <- c("95%", "90%", "85%", "80%", "75%", "70%", "65%", "60%", "55%", "50%",
+                                         "45%", "40%", "35%", "30%", "25%", "20%", "15%", "10%", "5%")
+                
+                tax_table
+                
+        })
+        
+        
+}
+
+
+shinyApp(ui = ui, server = server)
